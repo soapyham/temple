@@ -91,123 +91,118 @@ collect_compile_calls :: proc(
 
 	// TODO: does not support symbolic links, communicate it to users.
 
-	filepath.walk(
-		root,
-		proc(
-			info: os.File_Info,
-			in_err: os.Errno,
-			user_data: rawptr,
-		) -> (
-			err: os.Errno,
-			skip_dir: bool,
-		) {
-			if !info.is_dir {
-				return
-			}
+	process_dir :: proc(dir_path: string, s: ^Collect_State) {
+		pkg, ok := parser.parse_package_from_path(dir_path)
+		if !ok {
+			warn(nil, "%q is not a package", dir_path)
+			return
+		}
 
-			if in_err != os.ERROR_NONE {
-				warn(nil, "%q error code %i", info.fullpath, in_err)
-				return
-			}
+		s.pkg = pkg
 
+		// TODO: multithreading
+		// TODO: return early if not imported
+		// TODO; resolve any way it can be called (like alias `c :: temple.compiled`, or different import name `import t "temple"`)
 
-			pkg, ok := parser.parse_package_from_path(info.fullpath)
-			if !ok {
-				warn(nil, "%q is not a package", info.fullpath)
-				return
-			}
+		v := ast.Visitor {
+			data = s,
+			visit = proc(visitor: ^ast.Visitor, node: ^ast.Node) -> ^ast.Visitor {
+				if node == nil do return nil
 
-			s := cast(^Collect_State)user_data
-			s.pkg = pkg
+				#partial switch n in node.derived {
+				case ^ast.Call_Expr:
+					// selector, ok := n.expr.derived_expr.(^ast.Selector_Expr)
+					// if !ok do return nil
 
-			// TODO: multithreading
-			// TODO: return early if not imported
-			// TODO; resolve any way it can be called (like alias `c :: temple.compiled`, or different import name `import t "temple"`)
+					ident, iok := n.expr.derived_expr.(^ast.Ident)
+					if !iok do return nil
 
-			v := ast.Visitor {
-				data = s,
-				visit = proc(visitor: ^ast.Visitor, node: ^ast.Node) -> ^ast.Visitor {
-					if node == nil do return nil
-
-					#partial switch n in node.derived {
-					case ^ast.Call_Expr:
-						// selector, ok := n.expr.derived_expr.(^ast.Selector_Expr)
-						// if !ok do return nil
-
-						ident, iok := n.expr.derived_expr.(^ast.Ident)
-						if !iok do return nil
-
-						if ident.name != "temple_compiled" && ident.name != "temple_compiled_inline" {
-							return nil
-						}
-
-						// if selector.field.name != "compiled" && selector.field.name != "compiled_inline" {
-						// 	return nil
-						// }
-
-						s := cast(^Collect_State)visitor.data
-
-						if len(n.args) != 2 {
-							error(
-								n.pos,
-								"calls to `temple.compiled` and `temple.compiled_inline` expect 2 arguments, got %i",
-								len(n.args),
-							)
-						}
-
-						path, pok := n.args[0].derived_expr.(^ast.Basic_Lit)
-						if !pok || path.tok.kind != .String {
-							error(
-								n.pos,
-								"the path/template argument of `temple.compiled` and `temple.compiled_inline` only accepts string literals",
-							)
-						}
-
-						c: Compile_Call
-						c.pos = path.pos
-						c.pos.file = strings.clone(c.pos.file, s.allocator)
-
-						switch ident.name {
-						case "temple_compiled":
-							cp: Call_Path
-							defer c.type = cp
-
-							unqouted_path := strings.trim(path.tok.text, "\"`")
-
-							cp.relpath = strings.clone(unqouted_path, s.allocator)
-							cp.fullpath = filepath.join({s.pkg.fullpath, unqouted_path}, s.allocator)
-
-						case "temple_compiled_inline":
-							cp: Call_Inline
-							cp.template = strings.clone(strings.trim(path.tok.text, "\"`"), s.allocator)
-							c.type = cp
-						}
-
-						append(s.calls, c)
+					if ident.name != "temple_compiled" && ident.name != "temple_compiled_inline" {
+						return nil
 					}
 
-					return visitor
-				},
-			}
+					// if selector.field.name != "compiled" && selector.field.name != "compiled_inline" {
+					// 	return nil
+					// }
 
-			ast.walk(&v, pkg)
-			return
-		},
-		&s,
-	)
+					s := cast(^Collect_State)visitor.data
+
+					if len(n.args) != 2 {
+						error(
+							n.pos,
+							"calls to `temple.compiled` and `temple.compiled_inline` expect 2 arguments, got %i",
+							len(n.args),
+						)
+					}
+
+					path, pok := n.args[0].derived_expr.(^ast.Basic_Lit)
+					if !pok || path.tok.kind != .String {
+						error(
+							n.pos,
+							"the path/template argument of `temple.compiled` and `temple.compiled_inline` only accepts string literals",
+						)
+					}
+
+					c: Compile_Call
+					c.pos = path.pos
+					c.pos.file = strings.clone(c.pos.file, s.allocator)
+
+					switch ident.name {
+					case "temple_compiled":
+						cp: Call_Path
+						defer c.type = cp
+
+						unqouted_path := strings.trim(path.tok.text, "\"`")
+
+						cp.relpath = strings.clone(unqouted_path, s.allocator)
+						cp.fullpath, _ = filepath.join({s.pkg.fullpath, unqouted_path}, s.allocator)
+
+					case "temple_compiled_inline":
+						cp: Call_Inline
+						cp.template = strings.clone(strings.trim(path.tok.text, "\"`"), s.allocator)
+						c.type = cp
+					}
+
+					append(s.calls, c)
+				}
+
+				return visitor
+			},
+		}
+
+		ast.walk(&v, pkg)
+	}
+
+	if os.is_dir(root) {
+		process_dir(root, &s)
+	}
+
+	w := os.walker_create(root)
+	defer os.walker_destroy(&w)
+
+	for info in os.walker_walk(&w) {
+		if path, err := os.walker_error(&w); err != nil {
+			warn(nil, "%q error: %v", path, err)
+			continue
+		}
+
+		if info.type == .Directory {
+			process_dir(info.fullpath, &s)
+		}
+	}
 
 	return
 }
 
 transpile_calls :: proc(temple_path: string, calls: []Compile_Call, package_name: string) {
-	compiled_path := filepath.join({temple_path, "templates.odin"})
-	handle, errno := os.open(compiled_path, os.O_TRUNC | os.O_RDWR | os.O_CREATE, 0o600)
-	if errno != os.ERROR_NONE {
-		error(nil, "%q: unable to open file for generation", compiled_path)
+	compiled_path, _ := filepath.join({temple_path, "templates.odin"})
+	handle, err := os.create(compiled_path)
+	if err != nil {
+		error(nil, "%q: unable to open file for generation: %v", compiled_path, err)
 	}
 	defer os.close(handle)
 
-	s := os.stream_from_handle(handle)
+	s := os.to_stream(handle)
 
 	bw: bufio.Writer
 	bufio.writer_init(&bw, s)
@@ -290,9 +285,9 @@ write_transpiled_call :: proc(w: io.Writer, call: Compile_Call) -> (ok: bool) {
 	case Call_Path:
 		identifier = t.relpath
 		file = t.fullpath
-		d, ok := os.read_entire_file_from_filename(t.fullpath)
-		if !ok {
-			warn(nil, "unable to read template file at %q, skipping", t.fullpath)
+		d, err := os.read_entire_file(t.fullpath, context.allocator)
+		if err != nil {
+			warn(nil, "unable to read template file at %q: %v, skipping", t.fullpath, err)
 			return
 		}
 		data = d
@@ -337,17 +332,17 @@ write_generated_file_footer :: proc(w: io.Writer, has_calls: bool) {
 embed_parser :: proc(node: ^Node_Embed, parent_path_: rawptr) -> (Template, bool) {
 	parent_path := (cast(^string)parent_path_)^
 	relpath := node.path.value[1:len(node.path.value)-1]
-	fullpath := filepath.join({filepath.dir(parent_path), relpath})
+	fullpath, _ := filepath.join({filepath.dir(parent_path), relpath})
 
-	data, ok := os.read_entire_file_from_filename(fullpath)
-	if !ok {
+	data, err := os.read_entire_file(fullpath, context.allocator)
+	if err != nil {
 		pos := tokenizer.Pos{
 			offset = node.path.pos.offset,
 			line   = node.path.pos.line + 1,
 			column = node.path.pos.col + 1,
 			file   = parent_path,
 		}
-		warn(pos, "unable to read embedded template file at %q, skipping", fullpath)
+		warn(pos, "unable to read embedded template file at %q: %v, skipping", fullpath, err)
 		return {}, false
 	}
 
